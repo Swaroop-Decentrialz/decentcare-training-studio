@@ -210,6 +210,8 @@ export default function App() {
   const [pullMsg,   setPullMsg]   = useState("");
   const [showConn,  setShowConn]  = useState(false);
   const [processingId, setProcessingId] = useState(null);
+  const [fetching, setFetching] = useState(false);
+  const [fetchMsg, setFetchMsg] = useState("");
   // agents page
   const [agent,  setAg]  = useState("lead-qual");
   const [tab,    setTab] = useState("scenarios");
@@ -418,6 +420,28 @@ export default function App() {
     } catch(err) {
       setPullMsg(""); setPulling(false);
       toast$(`✗ ${err.message}`);
+    }
+  };
+
+  const fetchLatestCalls = async () => {
+    setFetching(true); setFetchMsg("Triggering backend fetch...");
+    try {
+      const railwayUrl = import.meta.env.VITE_RAILWAY_URL || '';
+      const resp = await fetch(`${railwayUrl}/api/cron/fetch-calls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-cron-secret': import.meta.env.VITE_CRON_SECRET || '' },
+      });
+      if (!resp.ok) { const err = await resp.json().catch(()=>({})); throw new Error(err.error || `HTTP ${resp.status}`); }
+      const result = await resp.json();
+      setFetchMsg(`Fetched ${result.fetched} calls. Refreshing...`);
+      const calls = await loadCalls();
+      if (calls?.length) setCiCalls(calls);
+      setFetchMsg(`Done! ${result.fetched} calls synced.`);
+      toast$(`✓ ${result.fetched} calls fetched, ${result.upserted} saved`);
+      setTimeout(() => { setFetching(false); setFetchMsg(""); }, 3000);
+    } catch (err) {
+      setFetchMsg(""); setFetching(false);
+      toast$(`✗ Fetch failed: ${err.message}`);
     }
   };
 
@@ -1087,8 +1111,11 @@ Respond in JSON only (no markdown):
                   <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13}} onClick={processAll}>⚡ Process All Untagged</button>
                 )}
                 <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={()=>setShowConn(true)}>⚙ API Config</button>
-                <button className="bp" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={pullCalls} disabled={pulling}>
-                  {pulling ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {pullMsg||"Pulling…"}</> : "⬇ Pull Calls from SmartFlo"}
+                <button className="bp" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={fetchLatestCalls} disabled={fetching}>
+                  {fetching ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {fetchMsg||"Fetching…"}</> : "🔄 Fetch Latest Calls"}
+                </button>
+                <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={pullCalls} disabled={pulling}>
+                  {pulling ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {pullMsg||"Pulling…"}</> : "⬇ Pull via Token"}
                 </button>
               </div>
             </div>
@@ -1147,8 +1174,11 @@ Respond in JSON only (no markdown):
                   Connect your Tata Tele SmartFlo account to pull call recordings, auto-transcribe them with AI, tag topics, and surface training opportunities.
                 </div>
                 <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+                  <button className="bp" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={fetchLatestCalls} disabled={fetching}>
+                    {fetching ? (fetchMsg||"Fetching…") : "🔄 Fetch Latest Calls"}
+                  </button>
                   <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={()=>setShowConn(true)}>⚙ Configure API Key</button>
-                  <button className="bp" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={pullCalls}>⬇ Pull Calls from SmartFlo</button>
+                  <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={pullCalls}>⬇ Pull via Token</button>
                 </div>
                 <div style={{marginTop:20,padding:"14px 20px",background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,display:"inline-block",textAlign:"left",maxWidth:520}}>
                   <div style={{fontSize:12,color:"#92400E",lineHeight:1.6}}>

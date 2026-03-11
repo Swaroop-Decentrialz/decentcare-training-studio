@@ -2,6 +2,8 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
+import cron from 'node-cron'
+import { syncCalls } from './smartflo-sync.js'
 
 const app  = express()
 const PORT = process.env.PORT || 3001
@@ -18,7 +20,7 @@ app.use(cors({
     cb(new Error(`CORS blocked: ${origin}`))
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-smartflo-token'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-smartflo-token', 'x-cron-secret'],
 }))
 
 app.use(express.json())
@@ -106,9 +108,43 @@ app.get('/api/smartflo/live', async (req, res) => {
   }
 })
 
+// ─── Cron: Manual fetch trigger ──────────────────────────────────────────────
+app.post('/api/cron/fetch-calls', async (req, res) => {
+  const secret = req.headers['x-cron-secret'] || req.query.secret
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized — invalid or missing CRON_SECRET' })
+  }
+
+  try {
+    const startDate = req.query.start_date || req.body?.start_date
+    const endDate   = req.query.end_date   || req.body?.end_date
+    const result = await syncCalls({ startDate, endDate })
+    return res.json({ ok: true, ...result })
+  } catch (err) {
+    console.error('[Cron/fetch-calls] Error:', err.message)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅ DecentCare backend running on port ${PORT}`)
   console.log(`   SmartFlo proxy → ${SMARTFLO_BASE}`)
   console.log(`   CORS origins: ${allowedOrigins.join(', ')}`)
+
+  // Daily 6 AM IST auto-fetch
+  if (process.env.SMARTFLO_USERNAME && process.env.SUPABASE_URL) {
+    cron.schedule('0 6 * * *', async () => {
+      console.log('[Cron] Daily SmartFlo sync triggered at', new Date().toISOString())
+      try {
+        const result = await syncCalls()
+        console.log('[Cron] Sync complete:', result)
+      } catch (err) {
+        console.error('[Cron] Sync failed:', err.message)
+      }
+    }, { timezone: 'Asia/Kolkata' })
+    console.log('   Cron: daily SmartFlo sync at 06:00 IST')
+  } else {
+    console.log('   Cron: SmartFlo sync DISABLED (missing SMARTFLO_USERNAME or SUPABASE_URL)')
+  }
 })
