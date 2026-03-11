@@ -3,7 +3,12 @@ import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
 import cron from 'node-cron'
+import { createClient } from '@supabase/supabase-js'
 import { syncCalls } from './smartflo-sync.js'
+
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+  : null
 
 const app  = express()
 const PORT = process.env.PORT || 3001
@@ -105,6 +110,167 @@ app.get('/api/smartflo/live', async (req, res) => {
     return res.json(body)
   } catch (err) {
     return res.status(502).json({ error: err.message })
+  }
+})
+
+// ─── SmartFlo proxy — Recording audio ────────────────────────────────────────
+// Proxies SmartFlo recording URLs so frontend can play audio without CORS issues
+app.get('/api/smartflo/recording', async (req, res) => {
+  const url = req.query.url
+  if (!url) return res.status(400).json({ error: 'Missing url query parameter' })
+
+  try {
+    console.log(`[Recording] Proxying: ${url}`)
+    const sfRes = await fetch(url, { timeout: 30000 })
+    if (!sfRes.ok) {
+      console.error(`[Recording] Error ${sfRes.status}`)
+      return res.status(sfRes.status).json({ error: `Recording fetch failed: ${sfRes.status}` })
+    }
+
+    const contentType = sfRes.headers.get('content-type') || 'audio/mpeg'
+    const contentLength = sfRes.headers.get('content-length')
+    res.setHeader('Content-Type', contentType)
+    if (contentLength) res.setHeader('Content-Length', contentLength)
+    res.setHeader('Accept-Ranges', 'bytes')
+
+    sfRes.body.pipe(res)
+  } catch (err) {
+    console.error('[Recording] Proxy error:', err.message)
+    return res.status(502).json({ error: 'Recording unreachable', detail: err.message })
+  }
+})
+
+// ─── Transcribe: Deepgram + Claude analysis ─────────────────────────────────
+app.post('/api/transcribe', async (req, res) => {
+  const { callId } = req.body
+  if (!callId) return res.status(400).json({ error: 'callId required' })
+  if (!supabase) return res.status(500).json({ error: 'Supabase not configured' })
+  if (!process.env.DEEPGRAM_API_KEY) return res.status(500).json({ error: 'DEEPGRAM_API_KEY not set' })
+
+  try {
+    // 1. Fetch call from Supabase
+    const { data: call, error: fetchErr } = await supabase
+      .from('call_intelligence')
+      .select('*')
+      .eq('id', callId)
+      .single()
+
+    if (fetchErr || !call) return res.status(404).json({ error: 'Call not found', detail: fetchErr })
+    if (!call.recording_url) return res.status(400).json({ error: 'No recording URL for this call' })
+
+    console.log(`[Transcribe] Processing ${callId} — ${call.recording_url}`)
+
+    // 2. Download audio
+    const audioRes = await fetch(call.recording_url, { timeout: 60000 })
+    if (!audioRes.ok) return res.status(502).json({ error: `Audio download failed: ${audioRes.status}` })
+    const audioBuffer = await audioRes.buffer()
+
+    // 3. Send to Deepgram for transcription
+    console.log(`[Transcribe] Sending ${audioBuffer.length} bytes to Deepgram`)
+    const dgRes = await fetch('https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&language=en', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+        'Content-Type': audioRes.headers.get('content-type') || 'audio/mpeg',
+      },
+      body: audioBuffer,
+      timeout: 120000,
+    })
+
+    if (!dgRes.ok) {
+      const dgErr = await dgRes.text()
+      console.error('[Transcribe] Deepgram error:', dgErr)
+      return res.status(502).json({ error: 'Deepgram transcription failed', detail: dgErr })
+    }
+
+    const dgData = await dgRes.json()
+    const transcript = dgData.results?.channels?.[0]?.alternatives?.[0]?.transcript || ''
+
+    if (!transcript || transcript.trim().length === 0) {
+      // Update as no transcript available
+      await supabase.from('call_intelligence').update({
+        transcript: 'No speech detected in recording',
+        processed_at: new Date().toISOString(),
+      }).eq('id', callId)
+      return res.json({ ok: true, callId, transcript: 'No speech detected', skippedAnalysis: true })
+    }
+
+    console.log(`[Transcribe] Got transcript (${transcript.length} chars), sending to Claude`)
+
+    // 4. Send transcript to Claude for analysis
+    let analysis = { summary: '', topics: [], sentiment: 'neutral', key_insights: [], training_opportunity: null }
+
+    if (process.env.ANTHROPIC_API_KEY) {
+      const prompt = `You are analyzing a hospital patient call for DecentCare, a surgical care platform.
+
+Call metadata:
+- Direction: ${call.direction}
+- Agent: ${call.agent_name}
+- Duration: ${call.duration}s
+- Date: ${call.date} ${call.time}
+- Status: ${call.status}
+
+Transcript:
+${transcript}
+
+Analyze this call transcript. Respond in JSON only (no markdown):
+{
+  "summary": "2-3 sentence summary of what the call was about",
+  "topics": ["array of topic ids from: pricing, insurance, scheduling, pre-op, post-op, complaint, emergency, multilingual, cancellation, general"],
+  "sentiment": "positive|neutral|negative",
+  "key_insights": ["insight 1", "insight 2"],
+  "training_opportunity": "One specific scenario this call suggests adding to agent training, or null if none"
+}`
+
+      const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        timeout: 30000,
+      })
+
+      if (claudeRes.ok) {
+        const claudeData = await claudeRes.json()
+        const text = claudeData.content?.[0]?.text || '{}'
+        const clean = text.replace(/```json|```/g, '').trim()
+        try { analysis = JSON.parse(clean) } catch (e) { console.error('[Transcribe] Claude JSON parse error:', e.message) }
+      } else {
+        console.error('[Transcribe] Claude API error:', claudeRes.status)
+      }
+    }
+
+    // 5. Update Supabase
+    const { error: updateErr } = await supabase
+      .from('call_intelligence')
+      .update({
+        transcript,
+        summary: analysis.summary || '',
+        topics: analysis.topics || [],
+        sentiment: analysis.sentiment || 'neutral',
+        key_insights: analysis.key_insights || [],
+        training_opportunity: analysis.training_opportunity || null,
+        processed_at: new Date().toISOString(),
+      })
+      .eq('id', callId)
+
+    if (updateErr) {
+      console.error('[Transcribe] Update error:', updateErr)
+      return res.status(500).json({ error: 'Failed to update call', detail: updateErr })
+    }
+
+    console.log(`[Transcribe] Done: ${callId}`)
+    return res.json({ ok: true, callId, transcript, analysis })
+  } catch (err) {
+    console.error('[Transcribe] Error:', err.message)
+    return res.status(500).json({ error: err.message })
   }
 })
 
