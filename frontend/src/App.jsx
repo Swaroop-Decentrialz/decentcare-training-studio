@@ -212,6 +212,9 @@ export default function App() {
   const [processingId, setProcessingId] = useState(null);
   const [fetching, setFetching] = useState(false);
   const [fetchMsg, setFetchMsg] = useState("");
+  const [selectedCalls, setSelectedCalls] = useState(new Set());
+  const [batchProcessing, setBatchProcessing] = useState(false);
+  const [batchProgress, setBatchProgress] = useState({done:0, total:0});
   // agents page
   const [agent,  setAg]  = useState("lead-qual");
   const [tab,    setTab] = useState("scenarios");
@@ -508,9 +511,41 @@ Respond in JSON only (no markdown):
 
   const processAll = async () => {
     const unprocessed = ciCalls.filter(c=>!c.transcript);
-    for(const call of unprocessed.slice(0,5)) { // max 5 at a time
-      await transcribeAndTag(call.id);
+    setBatchProcessing(true); setBatchProgress({done:0, total:Math.min(unprocessed.length,10)});
+    for(let i=0;i<Math.min(unprocessed.length,10);i++) {
+      await transcribeAndTag(unprocessed[i].id);
+      setBatchProgress({done:i+1, total:Math.min(unprocessed.length,10)});
       await new Promise(r=>setTimeout(r,500));
+    }
+    setBatchProcessing(false); setSelectedCalls(new Set());
+  };
+
+  const batchTranscribe = async () => {
+    const ids = [...selectedCalls];
+    if(!ids.length) return;
+    setBatchProcessing(true); setBatchProgress({done:0, total:ids.length});
+    for(let i=0;i<ids.length;i++) {
+      await transcribeAndTag(ids[i]);
+      setBatchProgress({done:i+1, total:ids.length});
+      await new Promise(r=>setTimeout(r,500));
+    }
+    setBatchProcessing(false); setSelectedCalls(new Set());
+  };
+
+  const toggleSelectCall = (callId) => {
+    setSelectedCalls(prev => {
+      const next = new Set(prev);
+      if(next.has(callId)) next.delete(callId); else next.add(callId);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    const unprocessed = ciFiltered.filter(c=>!c.transcript);
+    if(selectedCalls.size===unprocessed.length && unprocessed.length>0) {
+      setSelectedCalls(new Set());
+    } else {
+      setSelectedCalls(new Set(unprocessed.map(c=>c.id)));
     }
   };
 
@@ -587,7 +622,7 @@ Respond in JSON only (no markdown):
         <div style={{display:"flex",gap:4,background:"#F8FAFC",borderRadius:10,padding:3,border:"1px solid #E5E7EB"}}>
           <button className={`pg-btn${page==="agents"?" on":""}`} onClick={()=>setPg("agents")}>🤖 Agent Training</button>
           <button className={`pg-btn${page==="kb"?" on":""}`} onClick={()=>setPg("kb")}>📚 Knowledge Base</button>
-          <button className={`pg-btn${page==="ci"?" on":""}`} onClick={()=>setPg("ci")}>📞 Call Intelligence</button>
+          <button className={`pg-btn${page==="ci"?" on":""}`} onClick={()=>setPg("ci")}>CI Call Intelligence</button>
         </div>
 
         <div style={{display:"flex",alignItems:"center",gap:14}}>
@@ -637,7 +672,7 @@ Respond in JSON only (no markdown):
                 </div>
               ))}
             </div>
-          </>) : (<>
+          </>) : page==="kb" ? (<>
             <div style={{fontSize:11,fontWeight:600,color:"#9CA3AF",letterSpacing:.8,marginBottom:6,paddingLeft:4}}>CATEGORIES</div>
             {[{id:"all",label:"All Entries",icon:"📋",color:"#4F46E5"},...KB_CATS].map(c=>{
               const cnt=c.id==="all"?kb.length:kb.filter(k=>k.cat===c.id).length;
@@ -662,7 +697,7 @@ Respond in JSON only (no markdown):
                 </div>
               ))}
             </div>
-          </>)}
+          </>) : null}
           {page==="ci"&&(<>
             <div style={{fontSize:11,fontWeight:600,color:"#9CA3AF",letterSpacing:.8,marginBottom:6,paddingLeft:4}}>CALL FILTERS</div>
             {[
@@ -1101,29 +1136,46 @@ Respond in JSON only (no markdown):
             {/* Header */}
             <div style={{marginBottom:22,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
               <div>
-                <h1 style={{fontSize:22,fontWeight:700,letterSpacing:"-.4px"}}>📞 Call Intelligence</h1>
+                <h1 style={{fontSize:22,fontWeight:700,letterSpacing:"-.4px",display:"flex",alignItems:"center",gap:10}}><span style={{width:30,height:30,background:"#4F46E5",borderRadius:8,display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#fff",fontWeight:700}}>CI</span> Call Intelligence</h1>
                 <p style={{fontSize:13.5,color:"#9CA3AF",marginTop:3}}>
                   <span style={{color:"#4F46E5",fontWeight:600}}>{ciCalls.length} calls</span> imported · <span style={{color:"#059669",fontWeight:600}}>{ciCalls.filter(c=>c.transcript).length} transcribed</span> · {ciCalls.filter(c=>c.training_opportunity).length} training opportunities
                 </p>
               </div>
-              <div style={{display:"flex",gap:8}}>
-                {ciCalls.filter(c=>!c.transcript).length>0&&(
-                  <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13}} onClick={processAll}>⚡ Process All Untagged</button>
+              <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                {selectedCalls.size>0?(
+                  <button className="bp" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={batchTranscribe} disabled={batchProcessing}>
+                    {batchProcessing?<><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> Processing {batchProgress.done}/{batchProgress.total}</>:`Transcribe Selected (${selectedCalls.size})`}
+                  </button>
+                ):ciCalls.filter(c=>!c.transcript).length>0&&(
+                  <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13}} onClick={processAll} disabled={batchProcessing}>Process All Untagged</button>
                 )}
-                <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={()=>setShowConn(true)}>⚙ API Config</button>
+                <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={()=>setShowConn(true)}>API Config</button>
                 <button className="bp" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={fetchLatestCalls} disabled={fetching}>
-                  {fetching ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {fetchMsg||"Fetching…"}</> : "🔄 Fetch Latest Calls"}
+                  {fetching ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {fetchMsg||"Fetching..."}</> : "Fetch Latest Calls"}
                 </button>
                 <button className="bo" style={{padding:"8px 16px",borderRadius:9,fontSize:13,display:"flex",alignItems:"center",gap:6}} onClick={pullCalls} disabled={pulling}>
-                  {pulling ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> {pullMsg||"Pulling…"}</> : "⬇ Pull via Token"}
+                  {pulling ? <><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:12,height:12,border:"2px solid #374151",borderTopColor:"transparent",borderRadius:"50%"}} /> {pullMsg||"Pulling..."}</> : "Pull via Token"}
                 </button>
               </div>
             </div>
 
+            {/* Progress bar */}
+            {batchProcessing&&(
+              <div style={{marginBottom:16}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <span style={{fontSize:13,fontWeight:600,color:"#4F46E5"}}>Processing calls with AI...</span>
+                  <span style={{fontSize:13,fontWeight:600,color:"#4F46E5"}}>{batchProgress.done} / {batchProgress.total}</span>
+                </div>
+                <div style={{height:8,background:"#E5E7EB",borderRadius:4,overflow:"hidden"}}>
+                  <div style={{height:"100%",background:"#4F46E5",borderRadius:4,transition:"width .3s ease",width:`${batchProgress.total?((batchProgress.done/batchProgress.total)*100):0}%`}} />
+                </div>
+              </div>
+            )}
+
             {/* Stats */}
-            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:22}}>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:14,marginBottom:22}}>
               {[
-                {label:"Total Calls",    value:ciCalls.length,                                         color:"#4F46E5",icon:"📞"},
+                {label:"Total Calls",    value:ciCalls.length,                                         color:"#4F46E5",icon:"#"},
                 {label:"Transcribed",    value:ciCalls.filter(c=>c.transcript).length,                 color:"#059669",icon:"📝"},
                 {label:"Positive",       value:ciCalls.filter(c=>c.sentiment==="positive").length,     color:"#059669",icon:"😊"},
                 {label:"Negative",       value:ciCalls.filter(c=>c.sentiment==="negative").length,     color:"#DC2626",icon:"😟"},
@@ -1168,17 +1220,17 @@ Respond in JSON only (no markdown):
             {/* Empty state */}
             {ciCalls.length===0&&(
               <div className="card" style={{textAlign:"center",padding:"52px 24px"}}>
-                <div style={{fontSize:48,marginBottom:16}}>📞</div>
+                <div style={{width:56,height:56,background:"#EEF2FF",borderRadius:14,display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:22,color:"#4F46E5",fontWeight:700,marginBottom:16}}>CI</div>
                 <div style={{fontSize:17,fontWeight:700,color:"#111827",marginBottom:8}}>No Calls Imported Yet</div>
                 <div style={{fontSize:14,color:"#9CA3AF",maxWidth:420,margin:"0 auto 24px",lineHeight:1.6}}>
                   Connect your Tata Tele SmartFlo account to pull call recordings, auto-transcribe them with AI, tag topics, and surface training opportunities.
                 </div>
                 <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
                   <button className="bp" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={fetchLatestCalls} disabled={fetching}>
-                    {fetching ? (fetchMsg||"Fetching…") : "🔄 Fetch Latest Calls"}
+                    {fetching ? (fetchMsg||"Fetching...") : "Fetch Latest Calls"}
                   </button>
-                  <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={()=>setShowConn(true)}>⚙ Configure API Key</button>
-                  <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={pullCalls}>⬇ Pull via Token</button>
+                  <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={()=>setShowConn(true)}>Configure API Key</button>
+                  <button className="bo" style={{padding:"10px 20px",borderRadius:9,fontSize:14}} onClick={pullCalls}>Pull via Token</button>
                 </div>
                 <div style={{marginTop:20,padding:"14px 20px",background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,display:"inline-block",textAlign:"left",maxWidth:520}}>
                   <div style={{fontSize:12,color:"#92400E",lineHeight:1.6}}>
@@ -1191,6 +1243,17 @@ Respond in JSON only (no markdown):
             {/* Calls list */}
             {ciCalls.length>0&&(
               <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                {ciFiltered.filter(c=>!c.transcript).length>0&&(
+                  <div style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0"}}>
+                    <input type="checkbox" style={{width:16,height:16,accentColor:"#4F46E5",cursor:"pointer"}}
+                      checked={selectedCalls.size>0&&selectedCalls.size===ciFiltered.filter(c=>!c.transcript).length}
+                      onChange={toggleSelectAll} />
+                    <span style={{fontSize:12,color:"#6B7280",fontWeight:500}}>
+                      {selectedCalls.size>0?`${selectedCalls.size} selected`:`Select all untagged (${ciFiltered.filter(c=>!c.transcript).length})`}
+                    </span>
+                    {selectedCalls.size>0&&<button className="bo" style={{padding:"3px 10px",borderRadius:6,fontSize:11}} onClick={()=>setSelectedCalls(new Set())}>Clear</button>}
+                  </div>
+                )}
                 {ciFiltered.length===0&&<div style={{textAlign:"center",padding:"40px",color:"#9CA3AF",fontSize:14}}>No calls match this filter.</div>}
                 {ciFiltered.map(call=>{
                   const isOpen=ciView===call.id;
@@ -1199,9 +1262,14 @@ Respond in JSON only (no markdown):
                     <div key={call.id} className="krow">
                       {/* Row */}
                       <div style={{padding:"12px 16px",display:"flex",gap:12,alignItems:"center",cursor:"pointer"}} onClick={()=>setCiView(isOpen?null:call.id)}>
+                        {/* Checkbox for unprocessed calls */}
+                        {!call.transcript&&(
+                          <input type="checkbox" style={{width:16,height:16,accentColor:"#4F46E5",cursor:"pointer",flexShrink:0}}
+                            checked={selectedCalls.has(call.id)} onClick={e=>e.stopPropagation()} onChange={()=>toggleSelectCall(call.id)} />
+                        )}
                         {/* Direction icon */}
-                        <div style={{width:38,height:38,borderRadius:9,background:call.direction==="inbound"?"#EFF6FF":"#F5F3FF",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>
-                          {call.status==="missed"||call.status==="not_answered"?"📵":call.direction==="inbound"?"📥":"📤"}
+                        <div style={{width:38,height:38,borderRadius:9,background:(call.status==="missed"||call.status==="not_answered")?"#FEF2F2":call.direction==="inbound"?"#EFF6FF":"#F5F3FF",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,fontSize:13,fontWeight:700,color:(call.status==="missed"||call.status==="not_answered")?"#DC2626":call.direction==="inbound"?"#2563EB":"#7C3AED"}}>
+                          {(call.status==="missed"||call.status==="not_answered")?"✕":call.direction==="inbound"?"IN":"OUT"}
                         </div>
                         <div style={{flex:1,minWidth:0}}>
                           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3,flexWrap:"wrap"}}>
@@ -1211,11 +1279,14 @@ Respond in JSON only (no markdown):
                             {call.sentiment&&<span style={{fontSize:11,background:sentBg(call.sentiment),color:sentColor(call.sentiment),borderRadius:4,padding:"1px 7px",fontWeight:600}}>{sentIcon(call.sentiment)} {call.sentiment}</span>}
                             {call.training_opportunity&&<span style={{fontSize:11,background:"#FFFBEB",color:"#D97706",borderRadius:4,padding:"1px 7px",fontWeight:600}}>🎓 Training op</span>}
                           </div>
-                          <div style={{display:"flex",gap:12,fontSize:12,color:"#9CA3AF",flexWrap:"wrap"}}>
-                            <span>📅 {call.date} {call.time}</span>
-                            <span>⏱ {call.duration}s</span>
-                            <span style={{textTransform:"capitalize"}}>📶 {call.status}</span>
-                            {call.transcript&&<span style={{color:"#059669",fontWeight:500}}>✓ Transcribed</span>}
+                          <div style={{display:"flex",gap:10,fontSize:12,color:"#9CA3AF",flexWrap:"wrap",alignItems:"center"}}>
+                            <span>{call.date} {call.time}</span>
+                            <span>{call.duration}s</span>
+                            <span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:10,textTransform:"capitalize",
+                              background:(call.status==="answered"?"#ECFDF5":(call.status==="missed"||call.status==="not_answered")?"#FEF2F2":"#F3F4F6"),
+                              color:(call.status==="answered"?"#059669":(call.status==="missed"||call.status==="not_answered")?"#DC2626":"#6B7280")
+                            }}>{call.status==="not_answered"?"Missed":call.status}</span>
+                            {call.transcript&&<span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:10,background:"#ECFDF5",color:"#059669"}}>Transcribed</span>}
                           </div>
                           {(call.topics||[]).length>0&&(
                             <div style={{display:"flex",gap:4,marginTop:5,flexWrap:"wrap"}}>
@@ -1233,7 +1304,7 @@ Respond in JSON only (no markdown):
                               {isProcessing?<><span style={{animation:"spin .7s linear infinite",display:"inline-block",width:10,height:10,border:"1.5px solid #fff",borderTopColor:"transparent",borderRadius:"50%"}} /> Processing…</>:"🤖 Transcribe & Tag"}
                             </button>
                           )}
-                          <span style={{fontSize:11,color:"#9CA3AF"}}>{isOpen?"▲":"▼"}</span>
+                          <div style={{width:28,height:28,borderRadius:7,background:"#F3F4F6",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:"#6B7280",flexShrink:0,transition:"all .15s"}}>{isOpen?"▲":"▼"}</div>
                         </div>
                       </div>
 
