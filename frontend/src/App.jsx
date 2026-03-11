@@ -156,8 +156,7 @@ async function parseFile(file) {
           const chunks = str.match(/BT[\s\S]*?ET/g) || [];
           chunks.forEach(chunk => {
             const parts = chunk.match(/\(([^\)]+)\)/g)||[];
-            parts.forEach(p=>{ const t=p.slice(1,-1).replace(/\\n/g,"
-").replace(/\\t/g," "); if(t.trim().length>3) text+=t+" "; });
+            parts.forEach(p=>{ const t=p.slice(1,-1).replace(/\\n/g,"\n").replace(/\\t/g," "); if(t.trim().length>3) text+=t+" "; });
           });
           // Fallback: extract printable ASCII runs
           if (text.trim().length < 50) {
