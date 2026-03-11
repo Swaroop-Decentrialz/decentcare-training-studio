@@ -216,6 +216,8 @@ export default function App() {
   const [batchProcessing, setBatchProcessing] = useState(false);
   const [batchProgress, setBatchProgress] = useState({done:0, total:0});
   const [hideMissed, setHideMissed] = useState(true);
+  const [ciPage, setCiPage] = useState(1);
+  const CI_PER_PAGE = 10;
   // agents page
   const [agent,  setAg]  = useState("lead-qual");
   const [tab,    setTab] = useState("scenarios");
@@ -374,7 +376,7 @@ export default function App() {
 
   // ── CALL INTELLIGENCE ─────────────────────────────────────────────────────
   const ciHiddenCount = hideMissed ? ciCalls.filter(c => c.duration===0 || c.status==="missed" || c.status==="not_answered").length : 0;
-  const ciFiltered = ciCalls.filter(call => {
+  const ciFilteredAll = ciCalls.filter(call => {
     if (hideMissed && (call.duration===0 || call.status==="missed" || call.status==="not_answered")) return false;
     const matchDir = ciFilter==="all" || call.direction===ciFilter || call.status===ciFilter ||
       (ciFilter==="missed" && (call.status==="missed"||call.status==="not_answered")) ||
@@ -384,6 +386,10 @@ export default function App() {
       (call.summary||"").toLowerCase().includes(ciSearch.toLowerCase());
     return matchDir && matchQ;
   });
+  const ciTotalPages = Math.max(1, Math.ceil(ciFilteredAll.length / CI_PER_PAGE));
+  const ciFiltered = ciFilteredAll.slice((ciPage - 1) * CI_PER_PAGE, ciPage * CI_PER_PAGE);
+  // Reset page when filters change
+  useEffect(() => { setCiPage(1); }, [ciFilter, ciSearch, hideMissed]);
 
   const pullCalls = async () => {
     if(!ciConfig.apiKey) { toast$("⚠ Enter your SmartFlo API key first"); setShowConn(true); return; }
@@ -460,7 +466,7 @@ export default function App() {
       const resp = await fetch(`${railwayUrl}/api/transcribe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callId }),
+        body: JSON.stringify({ callId, recordingUrl: call.recording_url }),
       });
       if (!resp.ok) { const err = await resp.json().catch(()=>({})); throw new Error(err.error || `HTTP ${resp.status}`); }
       const result = await resp.json();
@@ -1251,7 +1257,7 @@ export default function App() {
                         {/* Audio player */}
                         {call.recording_url && call.duration > 0 ? (
                           <audio controls preload="none" onClick={e=>e.stopPropagation()}
-                            src={`${import.meta.env.VITE_RAILWAY_URL||''}/api/smartflo/recording?url=${encodeURIComponent(call.recording_url)}`}
+                            src={call.recording_url}
                             style={{height:32,maxWidth:200,flexShrink:0}} />
                         ) : (
                           <span style={{fontSize:10,color:"#9CA3AF",background:"#F3F4F6",padding:"3px 8px",borderRadius:6,flexShrink:0,whiteSpace:"nowrap"}}>No recording</span>
@@ -1337,6 +1343,39 @@ export default function App() {
                     </div>
                   );
                 })}
+
+                {/* Pagination */}
+                {ciTotalPages>1&&(
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 0",borderTop:"1px solid #E5E7EB",marginTop:4}}>
+                    <span style={{fontSize:12,color:"#9CA3AF"}}>
+                      Showing {((ciPage-1)*CI_PER_PAGE)+1}–{Math.min(ciPage*CI_PER_PAGE, ciFilteredAll.length)} of {ciFilteredAll.length} calls
+                    </span>
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <button className="bo" style={{padding:"4px 10px",borderRadius:6,fontSize:12}} disabled={ciPage===1} onClick={()=>setCiPage(p=>p-1)}>← Prev</button>
+                      {(() => {
+                        const pages = [];
+                        const total = ciTotalPages;
+                        if (total <= 7) {
+                          for (let i = 1; i <= total; i++) pages.push(i);
+                        } else {
+                          pages.push(1);
+                          if (ciPage > 3) pages.push('...');
+                          for (let i = Math.max(2, ciPage - 1); i <= Math.min(total - 1, ciPage + 1); i++) pages.push(i);
+                          if (ciPage < total - 2) pages.push('...');
+                          pages.push(total);
+                        }
+                        return pages.map((p, idx) =>
+                          p === '...' ? <span key={`e${idx}`} style={{padding:"0 4px",fontSize:12,color:"#9CA3AF"}}>...</span> :
+                          <button key={p} onClick={()=>setCiPage(p)}
+                            style={{width:28,height:28,borderRadius:6,fontSize:12,fontWeight:ciPage===p?700:500,
+                              background:ciPage===p?"#4F46E5":"transparent",color:ciPage===p?"#fff":"#6B7280",
+                              border:ciPage===p?"none":"1px solid #E5E7EB",cursor:"pointer"}}>{p}</button>
+                        );
+                      })()}
+                      <button className="bo" style={{padding:"4px 10px",borderRadius:6,fontSize:12}} disabled={ciPage===ciTotalPages} onClick={()=>setCiPage(p=>p+1)}>Next →</button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

@@ -142,7 +142,7 @@ app.get('/api/smartflo/recording', async (req, res) => {
 
 // ─── Transcribe: Deepgram + Claude analysis ─────────────────────────────────
 app.post('/api/transcribe', async (req, res) => {
-  const { callId } = req.body
+  const { callId, recordingUrl } = req.body
   if (!callId) return res.status(400).json({ error: 'callId required' })
   if (!supabase) return res.status(500).json({ error: 'Supabase not configured' })
   if (!process.env.DEEPGRAM_API_KEY) return res.status(500).json({ error: 'DEEPGRAM_API_KEY not set' })
@@ -156,38 +156,55 @@ app.post('/api/transcribe', async (req, res) => {
       .single()
 
     if (fetchErr || !call) return res.status(404).json({ error: 'Call not found', detail: fetchErr })
-    if (!call.recording_url) return res.status(400).json({ error: 'No recording URL for this call' })
+    const url = recordingUrl || call.recording_url
+    if (!url) return res.status(400).json({ error: 'No recording URL for this call' })
 
-    console.log(`[Transcribe] Processing ${callId} — ${call.recording_url}`)
+    console.log(`[Transcribe] Processing ${callId} — ${url}`)
 
-    // 2. Download audio
-    const audioRes = await fetch(call.recording_url, { timeout: 60000 })
+    // 2. Download audio (recording URLs have embedded tokens, no extra auth needed)
+    const audioRes = await fetch(url, { timeout: 60000 })
     if (!audioRes.ok) return res.status(502).json({ error: `Audio download failed: ${audioRes.status}` })
     const audioBuffer = await audioRes.buffer()
+    console.log(`[Transcribe] Downloaded ${audioBuffer.length} bytes`)
 
-    // 3. Send to Deepgram for transcription
-    console.log(`[Transcribe] Sending ${audioBuffer.length} bytes to Deepgram`)
-    const dgRes = await fetch('https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&language=en', {
+    if (audioBuffer.length < 100) {
+      await supabase.from('call_intelligence').update({
+        transcript: 'Recording too short or empty',
+        processed_at: new Date().toISOString(),
+      }).eq('id', callId)
+      return res.json({ ok: true, callId, transcript: 'Recording too short or empty', skippedAnalysis: true })
+    }
+
+    // 3. Send to Deepgram — nova-2, Hindi-English code-switch, smart format
+    const dgParams = new URLSearchParams({
+      model: 'nova-2',
+      language: 'hi',
+      detect_language: 'true',
+      smart_format: 'true',
+      punctuate: 'true',
+      diarize: 'true',
+    })
+    const dgRes = await fetch(`https://api.deepgram.com/v1/listen?${dgParams}`, {
       method: 'POST',
       headers: {
         'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-        'Content-Type': audioRes.headers.get('content-type') || 'audio/mpeg',
+        'Content-Type': 'audio/mpeg',
       },
       body: audioBuffer,
-      timeout: 120000,
     })
 
     if (!dgRes.ok) {
       const dgErr = await dgRes.text()
-      console.error('[Transcribe] Deepgram error:', dgErr)
+      console.error('[Transcribe] Deepgram error:', dgRes.status, dgErr)
       return res.status(502).json({ error: 'Deepgram transcription failed', detail: dgErr })
     }
 
     const dgData = await dgRes.json()
     const transcript = dgData.results?.channels?.[0]?.alternatives?.[0]?.transcript || ''
+    const detectedLang = dgData.results?.channels?.[0]?.detected_language || 'unknown'
+    console.log(`[Transcribe] Deepgram done: ${transcript.length} chars, lang=${detectedLang}`)
 
     if (!transcript || transcript.trim().length === 0) {
-      // Update as no transcript available
       await supabase.from('call_intelligence').update({
         transcript: 'No speech detected in recording',
         processed_at: new Date().toISOString(),
@@ -195,9 +212,7 @@ app.post('/api/transcribe', async (req, res) => {
       return res.json({ ok: true, callId, transcript: 'No speech detected', skippedAnalysis: true })
     }
 
-    console.log(`[Transcribe] Got transcript (${transcript.length} chars), sending to Claude`)
-
-    // 4. Send transcript to Claude for analysis
+    // 4. Send transcript to Claude Haiku for analysis (fast + cheap)
     let analysis = { summary: '', topics: [], sentiment: 'neutral', key_insights: [], training_opportunity: null }
 
     if (process.env.ANTHROPIC_API_KEY) {
@@ -230,11 +245,10 @@ Analyze this call transcript. Respond in JSON only (no markdown):
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 1000,
           messages: [{ role: 'user', content: prompt }],
         }),
-        timeout: 30000,
       })
 
       if (claudeRes.ok) {
@@ -243,7 +257,8 @@ Analyze this call transcript. Respond in JSON only (no markdown):
         const clean = text.replace(/```json|```/g, '').trim()
         try { analysis = JSON.parse(clean) } catch (e) { console.error('[Transcribe] Claude JSON parse error:', e.message) }
       } else {
-        console.error('[Transcribe] Claude API error:', claudeRes.status)
+        const errBody = await claudeRes.text()
+        console.error('[Transcribe] Claude API error:', claudeRes.status, errBody)
       }
     }
 
