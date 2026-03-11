@@ -1099,9 +1099,6 @@ export default function App() {
               </div>
             )}
           </>)}
-        </div>
-      </div>
-
 
           {/* ── CALL INTELLIGENCE PAGE ─────────────────────────────────────── */}
           {page==="ci"&&(<>
@@ -1364,6 +1361,9 @@ export default function App() {
               </div>
             )}
           </>)}
+
+        </div>
+      </div>
 
       {/* ══ ADD SCENARIO MODAL ════════════════════════════════════════════════ */}
       {addSc&&(
