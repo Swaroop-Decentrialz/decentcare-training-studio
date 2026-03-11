@@ -14,17 +14,17 @@ function getSupabase() {
 
 // ── Authenticate with SmartFlo ───────────────────────────────────────────────
 async function getSmartFloToken() {
-  const res = await fetch(`${SMARTFLO_BASE}/v1/auth/token`, {
+  const res = await fetch(`${SMARTFLO_BASE}/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', accept: 'application/json' },
     body: JSON.stringify({
-      username: process.env.SMARTFLO_USERNAME,
+      email: process.env.SMARTFLO_USERNAME,
       password: process.env.SMARTFLO_PASSWORD,
     }),
   })
   const body = await res.json()
-  if (!res.ok) throw new Error(`SmartFlo auth failed: ${body?.message || res.status}`)
-  return body.token || body.access_token || body.data?.token
+  if (!body.success && !res.ok) throw new Error(`SmartFlo auth failed: ${body?.message || res.status}`)
+  return body.access_token || body.token || body.data?.token
 }
 
 // ── Fetch one page of call records ───────────────────────────────────────────
