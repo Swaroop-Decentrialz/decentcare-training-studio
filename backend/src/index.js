@@ -83,10 +83,10 @@ app.post('/api/smartflo/auth', async (req, res) => {
     return res.status(400).json({ error: 'username and password required' })
 
   try {
-    const sfRes = await fetch(`${SMARTFLO_BASE}/v1/auth/token`, {
+    const sfRes = await fetch(`${SMARTFLO_BASE}/v1/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ email: username, password }),
     })
     const body = await sfRes.json()
     if (!sfRes.ok) return res.status(sfRes.status).json({ error: body?.message || 'Auth failed', detail: body })
