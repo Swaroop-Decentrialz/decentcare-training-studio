@@ -3,6 +3,7 @@ import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
 import cron from 'node-cron'
+import FormData from 'form-data'
 import { createClient } from '@supabase/supabase-js'
 import { syncCalls } from './smartflo-sync.js'
 
@@ -140,20 +141,17 @@ app.get('/api/smartflo/recording', async (req, res) => {
   }
 })
 
-// ─── Transcribe: Deepgram + Claude analysis ─────────────────────────────────
+// ─── Transcribe: Sarvam AI + Claude analysis ────────────────────────────────
 app.post('/api/transcribe', async (req, res) => {
   const { callId, recordingUrl } = req.body
   if (!callId) return res.status(400).json({ error: 'callId required' })
   if (!supabase) return res.status(500).json({ error: 'Supabase not configured' })
-  if (!process.env.DEEPGRAM_API_KEY) return res.status(500).json({ error: 'DEEPGRAM_API_KEY not set' })
+  if (!process.env.SARVAM_API_KEY) return res.status(500).json({ error: 'SARVAM_API_KEY not set' })
 
   try {
     // 1. Fetch call from Supabase
     const { data: call, error: fetchErr } = await supabase
-      .from('call_intelligence')
-      .select('*')
-      .eq('id', callId)
-      .single()
+      .from('call_intelligence').select('*').eq('id', callId).single()
 
     if (fetchErr || !call) return res.status(404).json({ error: 'Call not found', detail: fetchErr })
     const url = recordingUrl || call.recording_url
@@ -161,7 +159,7 @@ app.post('/api/transcribe', async (req, res) => {
 
     console.log(`[Transcribe] Processing ${callId} — ${url}`)
 
-    // 2. Download audio (recording URLs have embedded tokens, no extra auth needed)
+    // 2. Download audio (recording URLs have embedded tokens)
     const audioRes = await fetch(url, { timeout: 60000 })
     if (!audioRes.ok) return res.status(502).json({ error: `Audio download failed: ${audioRes.status}` })
     const audioBuffer = await audioRes.buffer()
@@ -175,34 +173,90 @@ app.post('/api/transcribe', async (req, res) => {
       return res.json({ ok: true, callId, transcript: 'Recording too short or empty', skippedAnalysis: true })
     }
 
-    // 3. Send to Deepgram — nova-2, Hindi-English code-switch, smart format
-    const dgParams = new URLSearchParams({
-      model: 'nova-2',
-      language: 'hi',
-      detect_language: 'true',
-      smart_format: 'true',
-      punctuate: 'true',
-      diarize: 'true',
-    })
-    const dgRes = await fetch(`https://api.deepgram.com/v1/listen?${dgParams}`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-        'Content-Type': 'audio/mpeg',
-      },
-      body: audioBuffer,
-    })
+    // 3. Send to Sarvam AI saaras:v3
+    let transcript = ''
+    let languageCode = 'unknown'
+    let languageConfidence = 0
 
-    if (!dgRes.ok) {
-      const dgErr = await dgRes.text()
-      console.error('[Transcribe] Deepgram error:', dgRes.status, dgErr)
-      return res.status(502).json({ error: 'Deepgram transcription failed', detail: dgErr })
+    const useBatch = (call.duration || 0) > 30
+
+    if (useBatch) {
+      // Batch API for calls > 30s — supports longer audio
+      console.log(`[Transcribe] Using Sarvam Batch API (duration: ${call.duration}s)`)
+      const batchForm = new FormData()
+      batchForm.append('file', audioBuffer, { filename: 'recording.mp3', contentType: 'audio/mpeg' })
+      batchForm.append('model', 'saaras:v3')
+      batchForm.append('with_diarization', 'true')
+
+      const batchRes = await fetch('https://api.sarvam.ai/speech-to-text-batch', {
+        method: 'POST',
+        headers: { 'api-subscription-key': process.env.SARVAM_API_KEY, ...batchForm.getHeaders() },
+        body: batchForm,
+      })
+
+      if (!batchRes.ok) {
+        const errText = await batchRes.text()
+        console.error('[Transcribe] Sarvam batch submit error:', batchRes.status, errText)
+        return res.status(502).json({ error: 'Sarvam batch submit failed', detail: errText })
+      }
+
+      const batchData = await batchRes.json()
+      const jobId = batchData.job_id || batchData.id
+      console.log(`[Transcribe] Sarvam batch job: ${jobId}`)
+
+      // Poll for completion (max 60s)
+      let result = null
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000))
+        const pollRes = await fetch(`https://api.sarvam.ai/speech-to-text-batch/${jobId}`, {
+          headers: { 'api-subscription-key': process.env.SARVAM_API_KEY },
+        })
+        if (!pollRes.ok) continue
+        const pollData = await pollRes.json()
+        if (pollData.status === 'completed' || pollData.transcript) {
+          result = pollData
+          break
+        }
+        if (pollData.status === 'failed') {
+          console.error('[Transcribe] Sarvam batch failed:', pollData)
+          return res.status(502).json({ error: 'Sarvam batch transcription failed', detail: pollData })
+        }
+      }
+
+      if (!result) return res.status(504).json({ error: 'Sarvam batch timed out after 60s' })
+
+      transcript = result.transcript || ''
+      languageCode = result.language_code || 'unknown'
+      languageConfidence = result.language_confidence || 0
+    } else {
+      // REST API for calls <= 30s
+      console.log(`[Transcribe] Using Sarvam REST API (duration: ${call.duration}s)`)
+      const form = new FormData()
+      form.append('file', audioBuffer, { filename: 'recording.mp3', contentType: 'audio/mpeg' })
+      form.append('model', 'saaras:v3')
+      form.append('mode', 'transcribe')
+      form.append('with_timestamps', 'false')
+      form.append('with_diarization', 'false')
+
+      const sttRes = await fetch('https://api.sarvam.ai/speech-to-text', {
+        method: 'POST',
+        headers: { 'api-subscription-key': process.env.SARVAM_API_KEY, ...form.getHeaders() },
+        body: form,
+      })
+
+      if (!sttRes.ok) {
+        const errText = await sttRes.text()
+        console.error('[Transcribe] Sarvam REST error:', sttRes.status, errText)
+        return res.status(502).json({ error: 'Sarvam transcription failed', detail: errText })
+      }
+
+      const sttData = await sttRes.json()
+      transcript = sttData.transcript || ''
+      languageCode = sttData.language_code || 'unknown'
+      languageConfidence = sttData.language_confidence || 0
     }
 
-    const dgData = await dgRes.json()
-    const transcript = dgData.results?.channels?.[0]?.alternatives?.[0]?.transcript || ''
-    const detectedLang = dgData.results?.channels?.[0]?.detected_language || 'unknown'
-    console.log(`[Transcribe] Deepgram done: ${transcript.length} chars, lang=${detectedLang}`)
+    console.log(`[Transcribe] Sarvam done: ${transcript.length} chars, lang=${languageCode} (${(languageConfidence * 100).toFixed(0)}%)`)
 
     if (!transcript || transcript.trim().length === 0) {
       await supabase.from('call_intelligence').update({
@@ -212,29 +266,32 @@ app.post('/api/transcribe', async (req, res) => {
       return res.json({ ok: true, callId, transcript: 'No speech detected', skippedAnalysis: true })
     }
 
-    // 4. Send transcript to Claude Haiku for analysis (fast + cheap)
-    let analysis = { summary: '', topics: [], sentiment: 'neutral', key_insights: [], training_opportunity: null }
+    // 4. Map language code to display name
+    const LANG_MAP = {
+      'hi-IN': 'Hindi', 'te-IN': 'Telugu', 'ta-IN': 'Tamil', 'kn-IN': 'Kannada',
+      'ml-IN': 'Malayalam', 'mr-IN': 'Marathi', 'gu-IN': 'Gujarati', 'bn-IN': 'Bengali',
+      'pa-IN': 'Punjabi', 'en-IN': 'English', 'en': 'English', 'hi': 'Hindi',
+    }
+    const langDisplay = LANG_MAP[languageCode] || languageCode
+
+    // 5. Send transcript to Claude Haiku for analysis
+    let analysis = { summary: '', topics: [], sentiment: 'neutral', language_detected: langDisplay, key_insights: [], training_opportunity: null }
 
     if (process.env.ANTHROPIC_API_KEY) {
-      const prompt = `You are analyzing a hospital patient call for DecentCare, a surgical care platform.
+      const prompt = `Language detected: ${languageCode} (${(languageConfidence * 100).toFixed(0)}%)
+Transcript: ${transcript}
 
-Call metadata:
-- Direction: ${call.direction}
-- Agent: ${call.agent_name}
-- Duration: ${call.duration}s
-- Date: ${call.date} ${call.time}
-- Status: ${call.status}
+This is a call between a hospital telecaller and patient for DecentCare surgical platform.
+Call metadata: Direction=${call.direction}, Agent=${call.agent_name}, Duration=${call.duration}s, Date=${call.date} ${call.time}, Status=${call.status}
 
-Transcript:
-${transcript}
-
-Analyze this call transcript. Respond in JSON only (no markdown):
+Return JSON only:
 {
-  "summary": "2-3 sentence summary of what the call was about",
-  "topics": ["array of topic ids from: pricing, insurance, scheduling, pre-op, post-op, complaint, emergency, multilingual, cancellation, general"],
+  "summary": "2-3 sentence summary in English",
+  "topics": ["array from: pricing|insurance|scheduling|pre-op|post-op|complaint|emergency|multilingual|cancellation|general"],
   "sentiment": "positive|neutral|negative",
-  "key_insights": ["insight 1", "insight 2"],
-  "training_opportunity": "One specific scenario this call suggests adding to agent training, or null if none"
+  "language_detected": "English/Hindi/Telugu/Tamil/Kannada/etc",
+  "key_insights": ["max 3 actionable insights"],
+  "training_opportunity": "specific scenario to add to agent training or null"
 }`
 
       const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -247,6 +304,7 @@ Analyze this call transcript. Respond in JSON only (no markdown):
         body: JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 1000,
+          system: 'You analyze Indian hospital patient calls for DecentCare. Always respond with valid JSON only, no markdown.',
           messages: [{ role: 'user', content: prompt }],
         }),
       })
@@ -262,27 +320,39 @@ Analyze this call transcript. Respond in JSON only (no markdown):
       }
     }
 
-    // 5. Update Supabase
-    const { error: updateErr } = await supabase
-      .from('call_intelligence')
-      .update({
-        transcript,
-        summary: analysis.summary || '',
-        topics: analysis.topics || [],
-        sentiment: analysis.sentiment || 'neutral',
-        key_insights: analysis.key_insights || [],
-        training_opportunity: analysis.training_opportunity || null,
-        processed_at: new Date().toISOString(),
-      })
-      .eq('id', callId)
-
-    if (updateErr) {
-      console.error('[Transcribe] Update error:', updateErr)
-      return res.status(500).json({ error: 'Failed to update call', detail: updateErr })
+    // 6. Update Supabase
+    const updateFields = {
+      transcript,
+      summary: analysis.summary || '',
+      topics: analysis.topics || [],
+      sentiment: analysis.sentiment || 'neutral',
+      key_insights: analysis.key_insights || [],
+      training_opportunity: analysis.training_opportunity || null,
+      language_detected: analysis.language_detected || langDisplay,
+      processed_at: new Date().toISOString(),
     }
 
-    console.log(`[Transcribe] Done: ${callId}`)
-    return res.json({ ok: true, callId, transcript, analysis })
+    const { error: updateErr } = await supabase
+      .from('call_intelligence').update(updateFields).eq('id', callId)
+
+    if (updateErr) {
+      // If language_detected column doesn't exist yet, retry without it
+      if (updateErr.message?.includes('language_detected')) {
+        delete updateFields.language_detected
+        const { error: retryErr } = await supabase
+          .from('call_intelligence').update(updateFields).eq('id', callId)
+        if (retryErr) {
+          console.error('[Transcribe] Update error (retry):', retryErr)
+          return res.status(500).json({ error: 'Failed to update call', detail: retryErr })
+        }
+      } else {
+        console.error('[Transcribe] Update error:', updateErr)
+        return res.status(500).json({ error: 'Failed to update call', detail: updateErr })
+      }
+    }
+
+    console.log(`[Transcribe] Done: ${callId} — ${langDisplay}`)
+    return res.json({ ok: true, callId, transcript, languageCode, languageDetected: analysis.language_detected || langDisplay, analysis })
   } catch (err) {
     console.error('[Transcribe] Error:', err.message)
     return res.status(500).json({ error: err.message })

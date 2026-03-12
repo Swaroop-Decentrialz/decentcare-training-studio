@@ -216,6 +216,7 @@ export default function App() {
   const [batchProcessing, setBatchProcessing] = useState(false);
   const [batchProgress, setBatchProgress] = useState({done:0, total:0});
   const [hideMissed, setHideMissed] = useState(true);
+  const [ciLangFilter, setCiLangFilter] = useState("all");
   const [ciPage, setCiPage] = useState(1);
   const CI_PER_PAGE = 10;
   // agents page
@@ -384,12 +385,13 @@ export default function App() {
     const matchQ = !ciSearch || call.agent_name?.toLowerCase().includes(ciSearch.toLowerCase()) ||
       call.client_number?.includes(ciSearch) || (call.transcript||"").toLowerCase().includes(ciSearch.toLowerCase()) ||
       (call.summary||"").toLowerCase().includes(ciSearch.toLowerCase());
-    return matchDir && matchQ;
+    const matchLang = ciLangFilter==="all" || (call.language_detected||"").toLowerCase()===ciLangFilter.toLowerCase();
+    return matchDir && matchQ && matchLang;
   });
   const ciTotalPages = Math.max(1, Math.ceil(ciFilteredAll.length / CI_PER_PAGE));
   const ciFiltered = ciFilteredAll.slice((ciPage - 1) * CI_PER_PAGE, ciPage * CI_PER_PAGE);
   // Reset page when filters change
-  useEffect(() => { setCiPage(1); }, [ciFilter, ciSearch, hideMissed]);
+  useEffect(() => { setCiPage(1); }, [ciFilter, ciSearch, hideMissed, ciLangFilter]);
 
   const pullCalls = async () => {
     if(!ciConfig.apiKey) { toast$("⚠ Enter your SmartFlo API key first"); setShowConn(true); return; }
@@ -479,9 +481,10 @@ export default function App() {
         sentiment: result.analysis?.sentiment || "neutral",
         key_insights: result.analysis?.key_insights || [],
         training_opportunity: result.analysis?.training_opportunity || null,
+        language_detected: result.languageDetected || result.analysis?.language_detected || null,
         processed_at: new Date().toISOString(),
       } : c));
-      toast$("✓ Call transcribed with Deepgram + analyzed");
+      toast$(`✓ Transcribed (${result.languageDetected || "unknown"}) + analyzed`);
     } catch(err) {
       toast$("✗ Processing failed: " + err.message);
     }
@@ -701,6 +704,25 @@ export default function App() {
                   <span>{t.icon}</span>
                   <span style={{flex:1,fontSize:12.5,overflow:"hidden",textOverflow:"ellipsis"}}>{t.label}</span>
                   {cnt>0&&<span style={{fontSize:11,background:"#F3F4F6",color:"#9CA3AF",borderRadius:10,padding:"1px 6px",fontWeight:600}}>{cnt}</span>}
+                </div>
+              );
+            })}
+            <div style={{fontSize:11,fontWeight:600,color:"#9CA3AF",letterSpacing:.8,margin:"16px 0 6px",paddingLeft:4}}>LANGUAGES</div>
+            {[
+              {id:"all",      label:"All Languages", icon:"🌍"},
+              {id:"Hindi",    label:"Hindi",         icon:"🇮🇳"},
+              {id:"Telugu",   label:"Telugu",        icon:"🇮🇳"},
+              {id:"Tamil",    label:"Tamil",         icon:"🇮🇳"},
+              {id:"Kannada",  label:"Kannada",       icon:"🇮🇳"},
+              {id:"English",  label:"English",       icon:"🌐"},
+            ].map(lang=>{
+              const on=ciLangFilter===lang.id;
+              const cnt=lang.id==="all"?ciCalls.filter(c=>c.language_detected).length:ciCalls.filter(c=>(c.language_detected||"").toLowerCase()===lang.id.toLowerCase()).length;
+              return (
+                <div key={lang.id} className={`nav-item${on?" on":""}`} onClick={()=>setCiLangFilter(lang.id)}>
+                  <span>{lang.icon}</span>
+                  <span style={{flex:1}}>{lang.label}</span>
+                  {cnt>0&&<span style={{fontSize:11,background:on?"#C7D2FE":"#F3F4F6",color:on?"#4F46E5":"#9CA3AF",borderRadius:10,padding:"1px 6px",fontWeight:600}}>{cnt}</span>}
                 </div>
               );
             })}
@@ -1235,6 +1257,7 @@ export default function App() {
                             <span style={{fontSize:13,color:"#6B7280",fontFamily:"monospace"}}>{call.client_number}</span>
                             {call.sentiment&&<span style={{fontSize:11,background:sentBg(call.sentiment),color:sentColor(call.sentiment),borderRadius:4,padding:"1px 7px",fontWeight:600}}>{sentIcon(call.sentiment)} {call.sentiment}</span>}
                             {call.training_opportunity&&<span style={{fontSize:11,background:"#FFFBEB",color:"#D97706",borderRadius:4,padding:"1px 7px",fontWeight:600}}>🎓 Training op</span>}
+                            {call.language_detected&&<span style={{fontSize:11,background:"#EFF6FF",color:"#2563EB",borderRadius:4,padding:"1px 7px",fontWeight:600}}>{call.language_detected==="Hindi"||call.language_detected==="hi-IN"?"🇮🇳":"🌐"} {call.language_detected}</span>}
                           </div>
                           <div style={{display:"flex",gap:10,fontSize:12,color:"#9CA3AF",flexWrap:"wrap",alignItems:"center"}}>
                             <span>{call.date} {call.time}</span>
