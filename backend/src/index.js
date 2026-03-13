@@ -3,7 +3,10 @@ import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
 import cron from 'node-cron'
-import FormData from 'form-data'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { SarvamAIClient } from 'sarvamai'
 import { createClient } from '@supabase/supabase-js'
 import { syncCalls } from './smartflo-sync.js'
 
@@ -162,7 +165,7 @@ app.post('/api/transcribe', async (req, res) => {
     // 2. Download audio (recording URLs have embedded tokens)
     const audioRes = await fetch(url, { timeout: 60000 })
     if (!audioRes.ok) return res.status(502).json({ error: `Audio download failed: ${audioRes.status}` })
-    const audioBuffer = await audioRes.buffer()
+    const audioBuffer = Buffer.from(await audioRes.arrayBuffer())
     console.log(`[Transcribe] Downloaded ${audioBuffer.length} bytes`)
 
     if (audioBuffer.length < 100) {
@@ -178,82 +181,73 @@ app.post('/api/transcribe', async (req, res) => {
     let languageCode = 'unknown'
     let languageConfidence = 0
 
+    const sarvamClient = new SarvamAIClient({ apiSubscriptionKey: process.env.SARVAM_API_KEY })
     const useBatch = (call.duration || 0) > 30
 
     if (useBatch) {
-      // Batch API for calls > 30s — supports longer audio
-      console.log(`[Transcribe] Using Sarvam Batch API (duration: ${call.duration}s)`)
-      const batchForm = new FormData()
-      batchForm.append('file', audioBuffer, { filename: 'recording.mp3', contentType: 'audio/mpeg' })
-      batchForm.append('model', 'saaras:v3')
-      batchForm.append('with_diarization', 'true')
+      // Batch SDK workflow for calls > 30s
+      console.log(`[Transcribe] Using Sarvam Batch SDK (duration: ${call.duration}s)`)
 
-      const batchRes = await fetch('https://api.sarvam.ai/speech-to-text-batch', {
-        method: 'POST',
-        headers: { 'api-subscription-key': process.env.SARVAM_API_KEY, ...batchForm.getHeaders() },
-        body: batchForm,
-      })
+      // Write audio to temp file (SDK needs file path)
+      const tmpFile = path.join(os.tmpdir(), `sarvam_${callId.replace(/[^a-zA-Z0-9]/g, '_')}.mp3`)
+      fs.writeFileSync(tmpFile, audioBuffer)
 
-      if (!batchRes.ok) {
-        const errText = await batchRes.text()
-        console.error('[Transcribe] Sarvam batch submit error:', batchRes.status, errText)
-        return res.status(502).json({ error: 'Sarvam batch submit failed', detail: errText })
-      }
-
-      const batchData = await batchRes.json()
-      const jobId = batchData.job_id || batchData.id
-      console.log(`[Transcribe] Sarvam batch job: ${jobId}`)
-
-      // Poll for completion (max 60s)
-      let result = null
-      for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 2000))
-        const pollRes = await fetch(`https://api.sarvam.ai/speech-to-text-batch/${jobId}`, {
-          headers: { 'api-subscription-key': process.env.SARVAM_API_KEY },
+      try {
+        const job = await sarvamClient.speechToTextJob.createJob({
+          model: 'saaras:v3',
+          mode: 'transcribe',
+          withDiarization: true,
         })
-        if (!pollRes.ok) continue
-        const pollData = await pollRes.json()
-        if (pollData.status === 'completed' || pollData.transcript) {
-          result = pollData
-          break
+        console.log(`[Transcribe] Sarvam batch job: ${job.jobId}`)
+
+        await job.uploadFiles([tmpFile])
+        console.log('[Transcribe] File uploaded to Sarvam')
+
+        await job.start()
+        console.log('[Transcribe] Batch job started, polling...')
+
+        const status = await job.waitUntilComplete(5, 180)
+        console.log(`[Transcribe] Batch job state: ${status.job_state}`)
+
+        if (status.job_state?.toLowerCase() === 'failed') {
+          return res.status(502).json({ error: 'Sarvam batch transcription failed', detail: status.error_message })
         }
-        if (pollData.status === 'failed') {
-          console.error('[Transcribe] Sarvam batch failed:', pollData)
-          return res.status(502).json({ error: 'Sarvam batch transcription failed', detail: pollData })
+
+        // Download output JSON
+        const outputDir = path.join(os.tmpdir(), `sarvam_out_${job.jobId}`)
+        await job.downloadOutputs(outputDir)
+        const outFiles = fs.readdirSync(outputDir)
+        if (outFiles.length > 0) {
+          const result = JSON.parse(fs.readFileSync(path.join(outputDir, outFiles[0]), 'utf-8'))
+          transcript = result.transcript || ''
+          languageCode = result.language_code || 'unknown'
+          languageConfidence = result.language_probability || result.language_confidence || 0
+          // Clean up output dir
+          for (const f of outFiles) fs.unlinkSync(path.join(outputDir, f))
+          fs.rmdirSync(outputDir)
         }
+      } finally {
+        // Clean up temp file
+        try { fs.unlinkSync(tmpFile) } catch (_) {}
       }
-
-      if (!result) return res.status(504).json({ error: 'Sarvam batch timed out after 60s' })
-
-      transcript = result.transcript || ''
-      languageCode = result.language_code || 'unknown'
-      languageConfidence = result.language_confidence || 0
     } else {
-      // REST API for calls <= 30s
+      // REST API for calls <= 30s (direct HTTP — works fine)
       console.log(`[Transcribe] Using Sarvam REST API (duration: ${call.duration}s)`)
-      const form = new FormData()
-      form.append('file', audioBuffer, { filename: 'recording.mp3', contentType: 'audio/mpeg' })
-      form.append('model', 'saaras:v3')
-      form.append('mode', 'transcribe')
-      form.append('with_timestamps', 'false')
-      form.append('with_diarization', 'false')
+      const tmpFile = path.join(os.tmpdir(), `sarvam_${callId.replace(/[^a-zA-Z0-9]/g, '_')}.mp3`)
+      fs.writeFileSync(tmpFile, audioBuffer)
 
-      const sttRes = await fetch('https://api.sarvam.ai/speech-to-text', {
-        method: 'POST',
-        headers: { 'api-subscription-key': process.env.SARVAM_API_KEY, ...form.getHeaders() },
-        body: form,
-      })
-
-      if (!sttRes.ok) {
-        const errText = await sttRes.text()
-        console.error('[Transcribe] Sarvam REST error:', sttRes.status, errText)
-        return res.status(502).json({ error: 'Sarvam transcription failed', detail: errText })
+      try {
+        const sttData = await sarvamClient.speechToText.transcribe({
+          file: fs.createReadStream(tmpFile),
+          model: 'saaras:v3',
+          mode: 'transcribe',
+        })
+        transcript = sttData.transcript || ''
+        languageCode = sttData.languageCode || sttData.language_code || 'unknown'
+        languageConfidence = sttData.languageProbability || sttData.language_probability || 0
+      } finally {
+        try { fs.unlinkSync(tmpFile) } catch (_) {}
       }
-
-      const sttData = await sttRes.json()
-      transcript = sttData.transcript || ''
-      languageCode = sttData.language_code || 'unknown'
-      languageConfidence = sttData.language_confidence || 0
     }
 
     console.log(`[Transcribe] Sarvam done: ${transcript.length} chars, lang=${languageCode} (${(languageConfidence * 100).toFixed(0)}%)`)
